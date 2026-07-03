@@ -3,12 +3,12 @@ import re
 import json
 import logging
 import base64
+import requests
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
-import openfoodfacts
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -384,8 +384,9 @@ Return ONLY valid JSON, no markdown, no explanation."""
 
 class Processor:
     def __init__(self):
-        self.ai = OpenAI()
-        self.off = openfoodfacts.API(user_agent="EatIQ/2.0")
+        self.ai  = OpenAI()
+        self.off_base = "https://search.openfoodfacts.org/search"
+        self.off_headers = {"User-Agent": "EatIQ/2.0 (https://eatiq.app)"}
 
     def extract_text_from_image(self, b64: str, mime: str) -> Dict:
         """Use GPT-4o Mini vision to extract raw text from receipt image."""
@@ -420,41 +421,65 @@ class Processor:
         return json.loads(raw)
 
     def fetch_nutrition(self, search_term: str, weight_str: str = None) -> Dict:
-        """Look up nutrition from Open Food Facts."""
+        """
+        Look up nutrition from Open Food Facts Search-a-licious API.
+        The legacy text_search endpoint (cgi/search.pl) returns 503 globally.
+        This uses the new Elasticsearch-powered search.openfoodfacts.org endpoint.
+        """
         try:
-            results = self.off.product.text_search(query=search_term)
-            if not results or not results.get("products"):
+            params = {
+                "q":              search_term,
+                "langs":          "en",
+                "page_size":      1,
+                "fields":         "product_name,brands,nutriments",
+            }
+            resp = requests.get(
+                self.off_base,
+                params=params,
+                headers=self.off_headers,
+                timeout=5
+            )
+            if resp.status_code != 200:
+                logger.warning(f"OFF search returned {resp.status_code} for '{search_term}'")
                 return {}
-            best = results["products"][0]
+
+            data = resp.json()
+            hits = data.get("hits", [])
+            if not hits:
+                return {}
+
+            best = hits[0]
             n = best.get("nutriments", {})
-            
-            # Parse weight for per-serving calculation
-            serving_g = self._parse_weight_grams(weight_str)
-            
+
             nutrition = {
                 "full_database_name": best.get("product_name"),
                 "brand":              best.get("brands", ""),
-                "calories_100g":      round(n.get("energy-kcal_100g") or 0, 1),
+                "calories_100g":      round(float(n.get("energy-kcal_100g") or 0), 1),
                 "macronutrients_per_100g": {
-                    "carbohydrates_g": round(n.get("carbohydrates_100g") or 0, 1),
-                    "proteins_g":      round(n.get("proteins_100g") or 0, 1),
-                    "fats_g":          round(n.get("fat_100g") or 0, 1),
+                    "carbohydrates_g": round(float(n.get("carbohydrates_100g") or 0), 1),
+                    "proteins_g":      round(float(n.get("proteins_100g") or 0), 1),
+                    "fats_g":          round(float(n.get("fat_100g") or 0), 1),
                 },
-                "sugar_100g":  round(n.get("sugars_100g") or 0, 1),
-                "fibre_100g":  round(n.get("fiber_100g") or 0, 1),
-                "salt_100g":   round(n.get("salt_100g") or 0, 1),
+                "sugar_100g": round(float(n.get("sugars_100g") or 0), 1),
+                "fibre_100g": round(float(n.get("fiber_100g") or 0), 1),
+                "salt_100g":  round(float(n.get("salt_100g") or 0), 1),
             }
-            
-            # Add per-serving if we have weight
+
+            # Add per-serving calculation if we have weight
+            serving_g = self._parse_weight_grams(weight_str)
             if serving_g:
                 factor = serving_g / 100
-                nutrition["serving_g"] = serving_g
+                nutrition["serving_g"]           = serving_g
                 nutrition["calories_per_serving"] = round(nutrition["calories_100g"] * factor, 0)
                 nutrition["protein_per_serving"]  = round(nutrition["macronutrients_per_100g"]["proteins_g"] * factor, 1)
                 nutrition["fat_per_serving"]      = round(nutrition["macronutrients_per_100g"]["fats_g"] * factor, 1)
                 nutrition["carbs_per_serving"]    = round(nutrition["macronutrients_per_100g"]["carbohydrates_g"] * factor, 1)
-            
+
             return nutrition
+
+        except requests.Timeout:
+            logger.warning(f"OFF timeout for '{search_term}'")
+            return {}
         except Exception as e:
             logger.error(f"OFF error for '{search_term}': {e}")
             return {}
